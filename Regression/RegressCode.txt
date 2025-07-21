@@ -1,0 +1,242 @@
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Lasso, Ridge, LinearRegression
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, BaggingRegressor
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.model_selection import GridSearchCV, train_test_split
+import numpy as np
+import re
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+#코랩에서 데이터 시각화를 더 잘하기 위함
+%matplotlib inline
+
+# 데이터 불러오기
+vehicle_data = pd.read_csv('/content/sample_data/used_cars.csv')
+
+# 데이터 전처리
+vehicle_data_cleaned = vehicle_data.dropna(subset=['accident', 'clean_title'])
+vehicle_data_cleaned = vehicle_data_cleaned.dropna(subset=['fuel_type'])
+vehicle_data_cleaned = vehicle_data_cleaned.drop(columns=['model', 'clean_title'])
+vehicle_data_cleaned['milage'] = vehicle_data_cleaned['milage'].replace({' mi.': '', ',': ''}, regex=True).astype(int)
+vehicle_data_cleaned['price'] = vehicle_data_cleaned['price'].replace({'\$': '', ',': ''}, regex=True).astype(int)
+vehicle_data_encoded = pd.get_dummies(vehicle_data_cleaned, columns=['fuel_type', 'transmission', 'accident', 'brand', 'ext_col', 'int_col'])
+
+# 엔진 사양에서 마력과 배기량 추출
+def extract_engine_info(engine):
+    hp_match = re.search(r'(\d+\.?\d*)HP', engine)
+    liter_match = re.search(r'(\d+\.?\d*)L', engine)
+    hp = float(hp_match.group(1)) if hp_match else None
+    liters = float(liter_match.group(1)) if liter_match else None
+    return pd.Series({'horsepower': hp, 'liters': liters})
+
+engine_info = vehicle_data_encoded['engine'].apply(extract_engine_info)
+vehicle_data_encoded = pd.concat([vehicle_data_encoded.drop(columns=['engine']), engine_info], axis=1)
+vehicle_data_encoded['engine_output'] = vehicle_data_encoded['horsepower'] * vehicle_data_encoded['liters']
+
+# 결측치 처리 - horsepower와 engine_output의 결측치를 각각의 평균값으로 대체
+vehicle_data_encoded['horsepower'] = vehicle_data_encoded['horsepower'].fillna(vehicle_data_encoded['horsepower'].mean())
+vehicle_data_encoded['engine_output'] = vehicle_data_encoded['engine_output'].fillna(vehicle_data_encoded['engine_output'].mean())
+vehicle_data_encoded['liters'] = vehicle_data_encoded['liters'].fillna(vehicle_data_encoded['liters'].mean())
+
+# 최종 확인
+vehicle_data_encoded[['horsepower', 'engine_output', 'liters']].info()
+
+# 이상치 제거 및 타깃 변수 정규화
+for feature in ['milage', 'price', 'horsepower', 'liters']:
+    Q1 = vehicle_data_encoded[feature].quantile(0.25)
+    Q3 = vehicle_data_encoded[feature].quantile(0.75)
+    IQR = Q3 - Q1
+    vehicle_data_encoded = vehicle_data_encoded[~((vehicle_data_encoded[feature] < (Q1 - 1.5 * IQR)) |
+                                                  (vehicle_data_encoded[feature] > (Q3 + 1.5 * IQR)))]
+vehicle_data_encoded['price'] = np.log1p(vehicle_data_encoded['price'])
+
+# ------------------------------- 새로운 특성 생성 -------------------------------
+vehicle_data_encoded['milage_horsepower_interaction'] = vehicle_data_encoded['milage'] * vehicle_data_encoded['horsepower']
+
+# ------------------------------- 상관관계 기반 특성 선택 -------------------------------
+# 1. 타깃 변수 'price'와의 상관관계가 낮은 특성 제거
+price_corr = vehicle_data_encoded.corr()['price'].drop('price')
+low_corr_threshold = 0.2
+low_corr_features = price_corr[price_corr.abs() < low_corr_threshold].index
+vehicle_data_encoded_filtered = vehicle_data_encoded.drop(columns=low_corr_features)
+
+# 2. 중복된 정보가 많은 상관관계 높은 특성 쌍 중 하나 제거 (상관관계 > 0.9)
+corr_matrix = vehicle_data_encoded_filtered.corr().abs()
+high_corr_pairs = [(corr_matrix.columns[i], corr_matrix.columns[j])
+                   for i in range(len(corr_matrix.columns)) 
+                   for j in range(i) 
+                   if corr_matrix.iloc[i, j] > 0.9]
+features_to_drop = {pair[1] for pair in high_corr_pairs}
+vehicle_data_encoded_reduced = vehicle_data_encoded_filtered.drop(columns=features_to_drop)
+
+vehicle_data_encoded_reduced.info()
+
+plt.figure(figsize=(24, 10))
+sns.heatmap(vehicle_data_encoded_reduced.corr(), annot=True, fmt=".2f", cmap='coolwarm')
+plt.title("Correlation Matrix of Reduced Features")
+plt.show()
+
+# 높은 상관관계를 가진 특성 제거
+vehicle_data_encoded_reduced = vehicle_data_encoded_reduced.drop(columns=['horsepower', 'liters'])
+vehicle_data_encoded_reduced.info()
+
+# ------------------------------- 스케일링 전후 데이터 분포 시각화 -------------------------------
+numeric_features = ['milage', 'engine_output', 'milage_horsepower_interaction', 'price']
+
+# 스케일링 전 데이터 분포 시각화
+for feature in numeric_features:
+    plt.figure(figsize=(8, 4))
+    sns.histplot(vehicle_data_encoded_reduced[feature].dropna(), kde=True)
+    plt.title(f'Distribution of {feature} (Before Scaling)')
+    plt.xlabel(feature)
+    plt.show()
+
+# 스케일링
+scaler = StandardScaler()
+vehicle_data_encoded_reduced[numeric_features] = scaler.fit_transform(vehicle_data_encoded_reduced[numeric_features])
+
+# 스케일링 후 데이터 분포 시각화
+for feature in numeric_features[:-1]:  # 'price' 제외
+    plt.figure(figsize=(8, 4))
+    sns.histplot(vehicle_data_encoded_reduced[feature].dropna(), kde=True)
+    plt.title(f'Distribution of {feature} (After Scaling)')
+    plt.xlabel(feature)
+    plt.show()
+
+# ------------------------------- 데이터 분리 -------------------------------
+# 훈련, 검증, 테스트 데이터 분리
+X = vehicle_data_encoded_reduced.drop(columns=['price'])  # 타깃 변수 'price' 제외
+y = vehicle_data_encoded_reduced['price']  # 타깃 변수 설정
+X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.3, random_state=42)
+X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+
+# 모델 정의 및 파라미터 그리드 설정
+models = {
+    "Linear Regression": Pipeline([
+        ('scaler', StandardScaler()),
+        ('regressor', LinearRegression())
+    ]),
+    "Lasso Regression": Pipeline([
+        ('scaler', StandardScaler()),
+        ('regressor', Lasso())
+    ]),
+    "Ridge Regression": Pipeline([
+        ('scaler', StandardScaler()),
+        ('regressor', Ridge())
+    ]),
+    "Random Forest": Pipeline([
+        ('scaler', StandardScaler()),
+        ('regressor', RandomForestRegressor())
+    ]),
+    "Gradient Boosting": Pipeline([
+        ('scaler', StandardScaler()),
+        ('regressor', GradientBoostingRegressor())
+    ]),
+    "K-Nearest Neighbors": Pipeline([
+        ('scaler', StandardScaler()),
+        ('regressor', KNeighborsRegressor())
+    ]),
+    "Bagging Regressor": Pipeline([
+        ('scaler', StandardScaler()),
+        ('regressor', BaggingRegressor())
+    ])
+}
+
+# ------------------------------- 초기 모델 성능 평가 -------------------------------
+model_performance = {}
+for model_name, model_pipeline in models.items():
+    model_pipeline.fit(X_train, y_train)
+    y_pred = model_pipeline.predict(X_val)
+    
+    # 평가 지표 계산
+    mse = mean_squared_error(y_val, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_val, y_pred)
+    r2 = r2_score(y_val, y_pred)
+    
+    print(f"{model_name} - MSE: {mse:.2f}, RMSE: {rmse:.2f}, MAE: {mae:.2f}, R²: {r2:.2f}")
+    model_performance[model_name] = {"MSE": mse, "RMSE": rmse, "MAE": mae, "R²": r2}
+
+# 중요 특성 확인 (Lasso 사용 시)
+lasso = Lasso(alpha=0.1)
+lasso.fit(X_train, y_train)
+important_features = np.where(lasso.coef_ != 0)[0]
+selected_features = X.columns[important_features]
+print("Selected important features:", selected_features)
+
+
+# ------------------------------- 파라미터 최적화 -------------------------------
+param_grids = {
+    "Lasso Regression": {'regressor__alpha': [0.01, 0.1, 1, 10]},
+    "Ridge Regression": {'regressor__alpha': [0.01, 0.1, 1, 10]},
+    "Random Forest": {
+        'regressor__n_estimators': [50, 100, 200],
+        'regressor__max_depth': [None, 10, 20]
+    },
+    "Gradient Boosting": {
+        'regressor__n_estimators': [50, 100, 200],
+        'regressor__learning_rate': [0.01, 0.1, 0.5],
+        'regressor__max_depth': [3, 5, 7]
+    },
+    "K-Nearest Neighbors": {'regressor__n_neighbors': [3, 5, 7, 9]}
+}
+
+# 최적화 결과 저장 딕셔너리
+best_models = {}
+best_scores = {}
+
+# 각 모델에 대해 GridSearchCV 수행
+for model_name, model_pipeline in models.items():
+    if model_name in param_grids:
+        print(f"Optimizing {model_name}...")
+        grid_search = GridSearchCV(model_pipeline, param_grids[model_name], cv=5, scoring='neg_mean_squared_error')
+        grid_search.fit(X_train, y_train)
+        
+        # 최적 파라미터와 성능 저장
+        best_models[model_name] = grid_search.best_estimator_
+        best_scores[model_name] = -grid_search.best_score_  # MSE이므로 음수로 변환
+        print(f"Best parameters for {model_name}: {grid_search.best_params_}")
+        print(f"Best MSE score for {model_name}: {best_scores[model_name]:.2f}")
+# 최적 모델 선택 (MSE가 가장 낮은 모델)
+best_model_name = min(best_scores, key=best_scores.get)
+print(f"\nBest Model after Parameter Optimization: {best_model_name} with MSE = {best_scores[best_model_name]:.2f}")
+
+# ------------------------------- 최종 모델 성능 평가 (테스트 데이터) -------------------------------
+# 최적 모델로 테스트 세트에서 성능 평가
+final_model = best_models[best_model_name]
+y_test_pred = final_model.predict(X_test)
+
+# 평가 지표 계산
+test_mse = mean_squared_error(y_test, y_test_pred)
+test_rmse = np.sqrt(test_mse)
+test_mae = mean_absolute_error(y_test, y_test_pred)
+test_r2 = r2_score(y_test, y_test_pred)
+
+print(f"\nFinal Model Performance on Test Data - {best_model_name}")
+print(f"MSE: {test_mse:.2f}, RMSE: {test_rmse:.2f}, MAE: {test_mae:.2f}, R²: {test_r2:.2f}")
+
+# ------------------------------- 잔차 분석 시각화 -------------------------------
+# 잔차(residual) = 실제 값 - 예측 값
+residuals = y_test - y_test_pred
+
+# 잔차 분포 시각화
+plt.figure(figsize=(8, 6))
+sns.histplot(residuals, kde=True)
+plt.title("Residual Distribution")
+plt.xlabel("Residuals")
+plt.show()
+
+# 예측 값 vs 잔차
+plt.figure(figsize=(8, 6))
+plt.scatter(y_test_pred, residuals, alpha=0.5)
+plt.hlines(y=0, xmin=min(y_test_pred), xmax=max(y_test_pred), colors='r')
+plt.title("Residuals vs Predicted Values")
+plt.xlabel("Predicted Values")
+plt.ylabel("Residuals")
+plt.show()
+
+
